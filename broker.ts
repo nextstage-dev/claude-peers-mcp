@@ -13,6 +13,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { messageContractVersion } from "./shared/message-contract.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -196,6 +197,13 @@ try {
   // Column already exists
 }
 
+// Additive migration keeps existing mail readable. Do not hide migration failures.
+const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(row => row.name));
+for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT" })) {
+  if (!messageColumns.has(name)) db.run(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
+}
+db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(from_id, client_message_id) WHERE client_message_id IS NOT NULL");
+
 db.run(`
   CREATE TABLE IF NOT EXISTS peer_leases (
     peer_id TEXT PRIMARY KEY,
@@ -344,12 +352,14 @@ const selectPeersByMachine = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?)
 `);
+const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
-  SELECT id, from_id, to_id, text, sent_at, delivered
+  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
   FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC, id ASC
 `);
 
@@ -360,7 +370,7 @@ const markDelivered = db.prepare(`
 `);
 
 const selectClaimableMessages = db.prepare(`
-  SELECT id, from_id, to_id, text, sent_at, delivered
+  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
   FROM messages
   WHERE to_id = ?
     AND delivered = 0
@@ -890,7 +900,30 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.map(decodePeer);
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+const sendMessage = db.transaction((body: SendMessageRequest) => {
+  if (!body || typeof body.from_id !== "string" || typeof body.to_id !== "string" || typeof body.text !== "string" || !body.text.trim() || Buffer.byteLength(body.text) > 65536) {
+    throw new HttpError(400, "send requires sender, recipient and nonempty text up to 64 KiB");
+  }
+  const kind = body.kind ?? (body.reply_to_id !== undefined ? "reply" : "request");
+  if (!["request", "reply", "notification"].includes(kind)) throw new HttpError(400, "invalid message kind");
+  const replyTo = body.reply_to_id ?? null;
+  if ((kind === "reply" && (!Number.isSafeInteger(replyTo) || Number(replyTo) < 1)) || (kind !== "reply" && replyTo !== null)) throw new HttpError(400, "reply requires a positive reply_to_id; other kinds cannot set it");
+  const clientId = body.client_message_id ?? null;
+  if (clientId !== null && (typeof clientId !== "string" || !clientId.trim() || clientId.length > 128)) throw new HttpError(400, "invalid client_message_id");
+  requireLeaseOwner(body.from_id, body);
+  if (clientId !== null) {
+    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
+    if (existing) {
+      if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
+      return { ok: true, message_id: existing.id, duplicate: true };
+    }
+  }
+  if (replyTo !== null) {
+    const original = selectMessageById.get(replyTo) as { from_id: string; to_id: string; kind: string } | null;
+    if (!original || original.kind !== "request" || original.to_id !== body.from_id || original.from_id !== body.to_id) throw new HttpError(400, "reply must reverse the participants of an existing request");
+  }
+
+  // A completed retry is returned above before stale-target pruning.
   cleanStalePeers();
   requireLeaseOwner(body.from_id, body);
   touchPeer(body.from_id);
@@ -907,8 +940,12 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} is stale` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId);
+  return { ok: true, message_id: Number(inserted.lastInsertRowid), duplicate: false };
+});
+
+function handleSendMessage(body: SendMessageRequest) {
+  return sendMessage(body);
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -1015,6 +1052,8 @@ Bun.serve({
       const body = await req.json();
 
       switch (path) {
+        case "/capabilities":
+          return Response.json({ message_contract: messageContractVersion, claim_ack: true, idempotent_send: true });
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":

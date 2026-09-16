@@ -23,6 +23,7 @@ import type {
   RegisterResponse,
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
+import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -306,6 +307,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        ...messageToolProperties,
         to_id: {
           type: "string" as const,
           description: "Target peer ID from list_peers.",
@@ -447,11 +449,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      const result = await sendPeerMessage(brokerFetch, {
         from_id: myId,
         to_id,
         text: message,
-      });
+      }, args as Record<string, unknown>);
 
       if (!result.ok) {
         return {
@@ -461,7 +463,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       return {
-        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}.` }],
+        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
       };
     }
 
@@ -538,7 +540,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const label = sender
           ? `${m.from_id}${sender.nickname ? ` (${sender.nickname})` : ""} [${sender.machine}] ${sender.summary || sender.cwd}`
           : m.from_id;
-        return `From ${label} (${m.sent_at}):\n${m.text}`;
+        return `Message ID ${m.id}, kind=${m.kind ?? "legacy"}${m.reply_to_id ? `, reply_to_id=${m.reply_to_id}` : ""}. From ${label} (${m.sent_at}):\n${m.text}`;
       });
 
       return {
