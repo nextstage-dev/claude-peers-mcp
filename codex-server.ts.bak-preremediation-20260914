@@ -22,8 +22,6 @@ import type {
   PollMessagesResponse,
   RegisterResponse,
 } from "./shared/types.ts";
-import { fileURLToPath } from "node:url";
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -70,7 +68,7 @@ let myContextWindow = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_WINDOW ?? 
 let myContextUsed = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_USED ?? process.env.CLAUDE_PEERS_CONTEXT_USED);
 let myContextNote = process.env.CODEX_PEER_CONTEXT_NOTE ?? process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
+const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
 const isLocalBroker = BROKER_URL.includes("127.0.0.1") || BROKER_URL.includes("localhost");
 
@@ -307,7 +305,6 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        ...messageToolProperties,
         to_id: {
           type: "string" as const,
           description: "Target peer ID from list_peers.",
@@ -449,11 +446,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      const result = await sendPeerMessage(brokerFetch, {
+      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
         from_id: myId,
         to_id,
         text: message,
-      }, args as Record<string, unknown>);
+      });
 
       if (!result.ok) {
         return {
@@ -463,7 +460,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       return {
-        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
+        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}.` }],
       };
     }
 
@@ -540,7 +537,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const label = sender
           ? `${m.from_id}${sender.nickname ? ` (${sender.nickname})` : ""} [${sender.machine}] ${sender.summary || sender.cwd}`
           : m.from_id;
-        return `Message ID ${m.id}, kind=${m.kind ?? "legacy"}${m.reply_to_id ? `, reply_to_id=${m.reply_to_id}` : ""}. From ${label} (${m.sent_at}):\n${m.text}`;
+        return `From ${label} (${m.sent_at}):\n${m.text}`;
       });
 
       return {
