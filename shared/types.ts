@@ -31,7 +31,11 @@ export interface Message {
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;
+  kind: MessageKind;
+  reply_to_id: number | null;
 }
+
+export type MessageKind = "request" | "reply" | "notification";
 
 // --- Broker API types ---
 
@@ -116,6 +120,16 @@ export interface SendMessageRequest extends LeaseCredentials {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+  kind?: MessageKind;
+  reply_to_id?: number;
+  client_message_id?: string;
+}
+
+export interface SendMessageResponse {
+  ok: boolean;
+  message_id?: number;
+  duplicate?: boolean;
+  error?: string;
 }
 
 export interface PollMessagesRequest {

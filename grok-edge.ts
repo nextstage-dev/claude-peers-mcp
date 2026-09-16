@@ -19,6 +19,8 @@
  *   GROK_PEER_ALLOWLIST      optional comma-separated to_id allowlist
  */
 
+import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+
 const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
 const FLEET_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const PUBLIC_TOKEN = process.env.GROK_MCP_TOKEN ?? "";
@@ -208,6 +210,7 @@ const TOOLS = [
           description: "Exact peer id, e.g. pc-nagatha-session-no-tty",
         },
         message: { type: "string", description: "Plain text body" },
+        ...messageToolProperties,
       },
       required: ["to_id", "message"],
     },
@@ -335,11 +338,11 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
     if (ALLOWLIST.length && !ALLOWLIST.includes(to_id)) {
       return textResult(`to_id ${to_id} is not on GROK_PEER_ALLOWLIST`, true);
     }
-    const sent = await broker("/send-message", {
+    const sent = await sendPeerMessage(broker, {
       from_id: PEER_ID,
       to_id,
       text: message,
-    });
+    }, a);
     if (!sent?.ok) {
       return textResult(sent?.error ?? "send failed", true);
     }
@@ -348,6 +351,8 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
         ok: true,
         from_id: PEER_ID,
         to_id,
+        message_id: sent.message_id,
+        duplicate: sent.duplicate,
         note: `Queued if target is live. No durable mailbox. Poll check_messages for replies to ${PEER_ID}.`,
       }),
     );

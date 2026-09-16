@@ -40,6 +40,7 @@ import {
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
+import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 // --- Configuration ---
 
@@ -292,6 +293,8 @@ type BufferedMessage = {
   from_machine: string;
   text: string;
   sent_at: string;
+  kind?: Message["kind"];
+  reply_to_id?: number | null;
 };
 
 const localMessageBuffer: BufferedMessage[] = [];
@@ -361,7 +364,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its message_id after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+When you receive a channel or peer-message, call ack_message with message_ids: [id] after reading it. For kind=request, reply using send_message with kind=reply and reply_to_id set to that message_id. Replies and notifications do not request another answer. Legacy messages without kind can be answered with the legacy send_message fields.
 
 Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
 
@@ -423,6 +426,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        ...messageToolProperties,
         to_id: {
           type: "string" as const,
           description: "The peer ID of the target Claude Code instance (from list_peers)",
@@ -505,11 +509,15 @@ const TOOLS = [
       properties: {
         message_ids: {
           type: "array" as const,
-          items: { type: "number" as const },
+          items: { type: ["number", "string"] as const },
           description: "Message IDs that this Claude session has received and read.",
         },
+        message_id: {
+          type: ["number", "string"] as const,
+          description:
+            "A single message ID. Accepted because the delivery notification names one id; equivalent to message_ids: [id].",
+        },
       },
-      required: ["message_ids"],
     },
   },
 ];
@@ -519,6 +527,17 @@ const TOOLS = [
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
+
+// Accept the singular ID named by older notifications as well as the array form.
+function normalizeAckIds(args: unknown): number[] {
+  const a = (args ?? {}) as { message_ids?: unknown; message_id?: unknown };
+  const source = a.message_ids ?? a.message_id;
+  const raw = source == null ? [] : Array.isArray(source) ? source : [source];
+  const ids = raw
+    .map((v) => (typeof v === "string" ? Number(v.trim()) : v))
+    .filter((v): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0);
+  return [...new Set(ids)];
+}
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
@@ -698,12 +717,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+        const result = await sendPeerMessage(brokerFetch, {
           from_id: myId,
           to_id,
           text: message,
           ...leaseCredentials(),
-        });
+        }, args as Record<string, unknown>);
         if (!result.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
@@ -711,7 +730,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
         };
       } catch (e) {
         return {
@@ -785,7 +804,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const messages = drainMessageBuffer();
         const lines = messages.map(
-          (m) => `Message ID ${m.id} from ${m.from_id}${m.from_machine ? ` [${m.from_machine}]` : ""} (${m.sent_at}):\n${m.text}`
+          (m) => `Message ID ${m.id}, kind=${m.kind ?? "legacy"}${m.reply_to_id ? `, reply_to_id=${m.reply_to_id}` : ""} from ${m.from_id}${m.from_machine ? ` [${m.from_machine}]` : ""} (${m.sent_at}):\n${m.text}`
         );
         return {
           content: [
@@ -809,10 +828,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "ack_message": {
-      const { message_ids } = args as { message_ids?: number[] };
-      const ids = Array.isArray(message_ids)
-        ? [...new Set(message_ids.filter((id) => Number.isSafeInteger(id) && id > 0))]
-        : [];
+      const ids = normalizeAckIds(args);
       if (!myId || myRole !== "owner" || !myLeaseId) {
         return {
           content: [{ type: "text" as const, text: "Only the active leased owner can acknowledge messages." }],
@@ -916,6 +932,8 @@ function toBufferedMessage(
     from_machine: sender?.machine ?? "",
     text: message.text,
     sent_at: message.sent_at,
+    kind: message.kind,
+    reply_to_id: message.reply_to_id,
   };
 }
 
@@ -924,12 +942,13 @@ function formatInboxMessage(message: Message, sender: SenderDetails | undefined)
   const header =
     `<peer-message source="claude-peers" message_id="${message.id}" from_id="${attr(message.from_id)}"` +
     ` from_machine="${attr(sender?.machine ?? "")}" from_cwd="${attr(sender?.cwd ?? "")}"` +
-    ` sent_at="${attr(message.sent_at)}">`;
+    ` sent_at="${attr(message.sent_at)}"${message.kind ? ` kind="${message.kind}"` : ""}${message.reply_to_id ? ` reply_to_id="${message.reply_to_id}"` : ""}>`;
   const summary = sender?.summary ? `from_summary: ${sender.summary}\n` : "";
   return (
     `${header}\n${summary}${message.text}\n</peer-message>\n` +
-    `Peer message from claude-peers. Call ack_message with message_id "${message.id}", ` +
-    `reply with send_message to "${message.from_id}" right away, then resume your work.`
+    `Peer message from claude-peers. Call ack_message with message_ids: [${message.id}], ` +
+    (message.kind === "reply" || message.kind === "notification" ? "No reply requested." :
+      `reply with send_message to "${message.from_id}"${message.kind ? ` with kind=reply and reply_to_id=${message.id}` : ""}, then resume your work.`)
   );
 }
 
@@ -1010,6 +1029,8 @@ async function pollAndPushMessages(): Promise<void> {
               // a numeric id fails with "meta.message_id: Invalid input" and
               // the whole notification is dropped.
               message_id: String(message.id),
+              ...(message.kind ? { kind: message.kind } : {}),
+              ...(message.reply_to_id ? { reply_to_id: String(message.reply_to_id) } : {}),
               acknowledgment: "Call ack_message after reading this channel message.",
             },
           },
