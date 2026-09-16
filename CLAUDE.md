@@ -1,144 +1,15 @@
----
-description: Use Bun instead of Node.js, npm, pnpm, or vite.
-globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
-alwaysApply: false
----
-
 # claude-peers
 
-Peer discovery and messaging MCP channel for Claude Code instances.
+Peer discovery and messaging for Claude and Codex sessions. Bun + TypeScript.
 
-## Architecture
+- `broker.ts` HTTP daemon on :7899 + SQLite. Live broker runs on theoldone as user systemd unit `claude-peers-broker.service`.
+- `server.ts` MCP stdio server, one per Claude session. `codex-server.ts` same for Codex. `grok-edge.ts` Grok bridge. `dashboard-server.ts` :8799.
+- `shared/types.ts` broker API types. `cli.ts` inspects broker state: `bun cli.ts status|peers|send <id> <msg>`.
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
-- `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
-- `cli.ts` — CLI utility for inspecting broker state.
+Canonical remote: `git@github.com:hinescreative/claude-peers-mcp.git` main. The louislva fork is not ours.
 
-## Running
-
-```bash
-# Register as a regular MCP server (user scope in ~/.claude.json, or .mcp.json):
-# { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
-#
-# Inbound pushes arrive through the host session's cross-session inbox socket
-# (CLAUDE_CODE_MESSAGING_SOCKET, Claude Code >= 2.1.224) in every host, desktop
-# included. No launch flag needed. The channel flag is only a fallback for
-# older CLIs:
-claude --dangerously-load-development-channels server:claude-peers
-
-# CLI:
-bun cli.ts status
-bun cli.ts peers
-bun cli.ts send <peer-id> <message>
-bun cli.ts kill-broker
-```
-
-## Bun
-
-Default to using Bun instead of Node.js.
-
-- Use `bun <file>` instead of `node <file>` or `ts-node <file>`
-- Use `bun test` instead of `jest` or `vitest`
-- Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
-- Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
-- Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
-- Use `bunx <package> <command>` instead of `npx <package> <command>`
-- Bun automatically loads .env, so don't use dotenv.
-
-## APIs
-
-- `Bun.serve()` supports WebSockets, HTTPS, and routes. Don't use `express`.
-- `bun:sqlite` for SQLite. Don't use `better-sqlite3`.
-- `Bun.redis` for Redis. Don't use `ioredis`.
-- `Bun.sql` for Postgres. Don't use `pg` or `postgres.js`.
-- `WebSocket` is built-in. Don't use `ws`.
-- Prefer `Bun.file` over `node:fs`'s readFile/writeFile
-- Bun.$`ls` instead of execa.
-
-## Testing
-
-Use `bun test` to run tests.
-
-```ts#index.test.ts
-import { test, expect } from "bun:test";
-
-test("hello world", () => {
-  expect(1).toBe(1);
-});
-```
-
-## Frontend
-
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
-
-Server:
-
-```ts#index.ts
-import index from "./index.html"
-
-Bun.serve({
-  routes: {
-    "/": index,
-    "/api/users/:id": {
-      GET: (req) => {
-        return new Response(JSON.stringify({ id: req.params.id }));
-      },
-    },
-  },
-  // optional websocket support
-  websocket: {
-    open: (ws) => {
-      ws.send("Hello, world!");
-    },
-    message: (ws, message) => {
-      ws.send(message);
-    },
-    close: (ws) => {
-      // handle close
-    }
-  },
-  development: {
-    hmr: true,
-    console: true,
-  }
-})
-```
-
-HTML files can import .tsx, .jsx or .js files directly and Bun's bundler will transpile & bundle automatically. `<link>` tags can point to stylesheets and Bun's CSS bundler will bundle.
-
-```html#index.html
-<html>
-  <body>
-    <h1>Hello, world!</h1>
-    <script type="module" src="./frontend.tsx"></script>
-  </body>
-</html>
-```
-
-With the following `frontend.tsx`:
-
-```tsx#frontend.tsx
-import React from "react";
-import { createRoot } from "react-dom/client";
-
-// import .css files directly and it works
-import './index.css';
-
-const root = createRoot(document.body);
-
-export default function Frontend() {
-  return <h1>Hello, world!</h1>;
-}
-
-root.render(<Frontend />);
-```
-
-Then, run index.ts
-
-```sh
-bun --hot ./index.ts
-```
-
-For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+- Use Bun: `bun test`, `bunx tsc --noEmit -p .`, `bun install`, `bun:sqlite`. No node, npm, vite, express.
+- Restarting the live broker drops every peer for about a minute. Do it once, deliberately, after the code is verified.
+- Test harness must scrub `CLAUDE_CODE_MESSAGING_SOCKET` or fixtures land in a live session.
+- Never commit or print `CLAUDE_PEERS_TOKEN`, `GROK_MCP_TOKEN`, or anything from `~/.fleet-secrets/`.
+- Contract: `docs/peers-broker-CONTRACT.md`.
