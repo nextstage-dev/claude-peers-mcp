@@ -22,6 +22,11 @@ import type {
   PollMessagesResponse,
   RegisterResponse,
 } from "./shared/types.ts";
+import {
+  normalizeSendTarget,
+  SEND_TARGET_HELP,
+  SEND_TARGET_SCHEMA_PROPERTIES,
+} from "./shared/send-target.ts";
 import { fileURLToPath } from "node:url";
 
 type ClaudePeersEnv = {
@@ -302,20 +307,18 @@ const TOOLS = [
   },
   {
     name: "send_message",
-    description: "Send a message to any peer by peer ID.",
+    description:
+      'Send a message to any peer. The target peer ID goes in to_id (peer_id is accepted as an alias), e.g. send_message({to_id: "box-repo-042", message: "..."}).',
     inputSchema: {
       type: "object" as const,
       properties: {
-        to_id: {
-          type: "string" as const,
-          description: "Target peer ID from list_peers.",
-        },
+        ...SEND_TARGET_SCHEMA_PROPERTIES,
         message: {
           type: "string" as const,
           description: "Message text to send.",
         },
       },
-      required: ["to_id", "message"],
+      required: ["message"],
     },
   },
   {
@@ -439,7 +442,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "send_message": {
       await ensureRegistered();
-      const { to_id, message } = args as { to_id: string; message: string };
+      const to_id = normalizeSendTarget(args);
+      const message = (args as { message?: unknown })?.message;
+      if (!to_id) {
+        return {
+          content: [{ type: "text" as const, text: `send_message needs the target peer's ID. ${SEND_TARGET_HELP}` }],
+          isError: true,
+        };
+      }
+      if (typeof message !== "string" || message.trim().length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "send_message needs a non-empty message string in `message`." }],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet." }],
@@ -455,7 +471,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       if (!result.ok) {
         return {
-          content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+          content: [{ type: "text" as const, text: `Failed to send: ${result.error}. ${SEND_TARGET_HELP}` }],
           isError: true,
         };
       }

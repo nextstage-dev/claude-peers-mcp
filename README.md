@@ -114,7 +114,7 @@ Start Claude Code normally. The MCP server connects to the broker automatically.
 | Tool | Description |
 |------|-------------|
 | `list_peers` | Discover other instances. Scopes: `fleet` (all machines), `machine` (same host), `directory` (same cwd), `repo` (same git root) |
-| `send_message` | Send a message to another instance by peer ID. Arrives instantly via channel push |
+| `send_message` | Send a message to another instance — target peer ID in `to_id` (`peer_id` accepted as an alias). Arrives instantly via channel push |
 | `set_summary` | Set a 1-2 sentence summary of current work, visible to other peers |
 | `check_messages` | Manually check for messages (fallback when channels aren't enabled) |
 
@@ -142,7 +142,7 @@ Codex tools:
 |------|-------------|
 | `peer_status` | Show Codex's peer ID, broker URL, machine, cwd, git root, and summary |
 | `list_peers` | Find Claude/Codex peers. Scopes: `fleet`, `machine`, `directory`, or `repo` |
-| `send_message` | Send a message to another peer by ID |
+| `send_message` | Send a message to another peer — target peer ID in `to_id` |
 | `set_summary` | Describe what this Codex peer is doing |
 | `check_messages` | Poll Codex's peer inbox |
 

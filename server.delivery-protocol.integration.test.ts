@@ -205,7 +205,7 @@ class ClientHarness {
     );
   }
 
-  async callTool(name: string, args: JsonObject): Promise<void> {
+  async callTool(name: string, args: JsonObject): Promise<JsonRpcMessage> {
     const id = ++this.rpcId;
     await this.writeRpc({
       jsonrpc: "2.0",
@@ -221,6 +221,31 @@ class ClientHarness {
     if (response?.error) {
       throw new Error(`${name} returned an MCP error`);
     }
+    return response!;
+  }
+
+  // A tool that returns {isError: true} is a normal JSON-RPC result, so its text
+  // is the only place a validation failure shows up.
+  async callToolText(name: string, args: JsonObject): Promise<{ text: string; isError: boolean }> {
+    const response = await this.callTool(name, args);
+    const result = response.result as
+      | { content?: Array<{ text?: string }>; isError?: boolean }
+      | undefined;
+    return {
+      text: result?.content?.map((part) => part.text ?? "").join("\n") ?? "",
+      isError: result?.isError === true,
+    };
+  }
+
+  async listTools(): Promise<Array<JsonObject>> {
+    const id = ++this.rpcId;
+    await this.writeRpc({ jsonrpc: "2.0", id, method: "tools/list", params: {} });
+    await waitUntil(
+      () => this.rpcMessages.some((message) => message.id === id),
+      "tools/list response",
+    );
+    const response = this.rpcMessages.find((message) => message.id === id);
+    return ((response?.result as { tools?: Array<JsonObject> })?.tools ?? []);
   }
 
   async killParentOnly(): Promise<void> {
@@ -761,5 +786,130 @@ describe("server.ts payload v2 delivery client", () => {
     expect(typeof registration.instance_id).toBe("string");
     expect((registration.instance_id as string).length).toBeGreaterThan(0);
     expect(harness.requestsFor("/claim-messages").length).toBe(0);
+  });
+});
+
+// send_message only ever declared to_id, while its own description said "by
+// peer ID" and the delivery notification said `reply with send_message to
+// "<id>"`. A caller following those sent {peer_id: "..."}; the handler read
+// to_id as undefined, JSON.stringify dropped the key, and the broker answered
+// "Peer undefined not found" — a second-order error that blames the peer
+// rather than the argument name. Observed 2026-09-17 from ChatGPT through the
+// MetaMCP gateway.
+describe("send_message target argument", () => {
+  const leaseId = "send-target-lease";
+
+  function ownerBroker(extra?: BrokerHandler): BrokerHandler {
+    return (path, body, requests) => {
+      if (path === "/register") {
+        return {
+          json: {
+            id: "server-protocol-test-peer",
+            role: "owner",
+            lease_id: leaseId,
+            lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+          },
+        };
+      }
+      return extra?.(path, body, requests);
+    };
+  }
+
+  test("to_id still reaches the broker unchanged", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+
+    const result = await harness.callToolText("send_message", {
+      to_id: "fake-recipient",
+      message: "classic call",
+    });
+    expect(result.isError).toBe(false);
+
+    const sent = harness.requestsFor("/send-message");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body.to_id).toBe("fake-recipient");
+    expect(sent[0]!.body.text).toBe("classic call");
+  });
+
+  test("peer_id is accepted as an alias and sends the same request", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+
+    const result = await harness.callToolText("send_message", {
+      peer_id: "fake-recipient",
+      message: "alias call",
+    });
+    expect(result.isError).toBe(false);
+
+    const sent = harness.requestsFor("/send-message");
+    expect(sent).toHaveLength(1);
+    // The alias is translated at the tool boundary: the wire still says to_id.
+    expect(sent[0]!.body.to_id).toBe("fake-recipient");
+    expect(sent[0]!.body.peer_id).toBeUndefined();
+  });
+
+  test("a call with no target names the accepted arguments and never reaches the broker", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+
+    const result = await harness.callToolText("send_message", { message: "no target" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("to_id");
+    expect(result.text).toContain("peer_id");
+    expect(result.text).toContain("list_peers");
+    // The whole point: nothing is sent, so the broker cannot answer
+    // "Peer undefined not found".
+    expect(harness.requestsFor("/send-message")).toHaveLength(0);
+    expect(result.text).not.toContain("undefined");
+  });
+
+  test("an empty message is rejected before the broker call", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+
+    const result = await harness.callToolText("send_message", { to_id: "fake-recipient", message: "   " });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("message");
+    expect(harness.requestsFor("/send-message")).toHaveLength(0);
+  });
+
+  test("an unregistered peer ID says a registered peer ID is what is needed", async () => {
+    const harness = await startClient(
+      ownerBroker((path) => {
+        if (path === "/send-message") {
+          return { json: { ok: false, error: "Peer session_01ABC not found" } };
+        }
+      }),
+    );
+    await harness.waitForRequest("/register");
+
+    const result = await harness.callToolText("send_message", {
+      to_id: "session_01ABC",
+      message: "wrong kind of id",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("Peer session_01ABC not found");
+    expect(result.text).toContain("registered peer ID");
+    expect(result.text).toContain("list_peers");
+  });
+
+  test("tools/list advertises both argument names and does not force to_id", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+
+    const tools = await harness.listTools();
+    const sendMessage = tools.find((tool) => tool.name === "send_message");
+    expect(sendMessage).toBeDefined();
+
+    const schema = sendMessage!.inputSchema as {
+      properties: Record<string, { description?: string }>;
+      required: string[];
+    };
+    expect(Object.keys(schema.properties).sort()).toEqual(["message", "peer_id", "to_id"]);
+    // message stays required; to_id must not be, or a peer_id-only call is
+    // schema-invalid and a strict client refuses it before the server sees it.
+    expect(schema.required).toEqual(["message"]);
+    // The name a client would otherwise have to guess is in the prose too.
+    expect(sendMessage!.description as string).toContain("to_id");
   });
 });

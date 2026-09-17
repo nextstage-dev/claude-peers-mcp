@@ -38,6 +38,11 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import {
+  normalizeSendTarget,
+  SEND_TARGET_HELP,
+  SEND_TARGET_SCHEMA_PROPERTIES,
+} from "./shared/send-target.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 
@@ -372,12 +377,12 @@ const mcp = new Server(
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its id (message_ids: [<id>]) after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
+Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id as to_id: send_message({to_id: "<their from_id>", message: "..."}).
 
 Available tools:
 - peer_status: Show this instance's own peer ID, nickname, broker, cwd, and summary
 - list_peers: Discover other Claude Code instances (scope: fleet/machine/directory/repo)
-- send_message: Send a message to another instance by ID
+- send_message: Send a message to another instance — the target peer ID goes in to_id
 - set_nickname: Set a short human-readable name for this instance
 - set_context: Set this instance's context window metadata
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
@@ -428,20 +433,17 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification. Works across machines.",
+      "Send a message to another Claude Code instance. The target peer ID goes in to_id (peer_id is accepted as an alias), e.g. send_message({to_id: \"box-repo-042\", message: \"...\"}). The message is pushed into their session immediately via channel notification. Works across machines.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        to_id: {
-          type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
-        },
+        ...SEND_TARGET_SCHEMA_PROPERTIES,
         message: {
           type: "string" as const,
           description: "The message to send",
         },
       },
-      required: ["to_id", "message"],
+      required: ["message"],
     },
   },
   {
@@ -549,6 +551,7 @@ function normalizeAckIds(args: unknown): number[] {
     .filter((v): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0);
   return [...new Set(ids)];
 }
+
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
@@ -720,7 +723,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const to_id = normalizeSendTarget(args);
+      const message = (args as { message?: unknown })?.message;
+      if (!to_id) {
+        return {
+          content: [{ type: "text" as const, text: `send_message needs the target peer's ID. ${SEND_TARGET_HELP}` }],
+          isError: true,
+        };
+      }
+      if (typeof message !== "string" || message.trim().length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "send_message needs a non-empty message string in `message`." }],
+          isError: true,
+        };
+      }
       if (!myId || !canMutateBroker()) {
         return {
           content: [{ type: "text" as const, text: myRole === "standby" ? "Standby peer cannot send messages" : "Not registered with broker yet" }],
@@ -735,8 +751,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ...leaseCredentials(),
         });
         if (!result.ok) {
+          // A well-formed id the broker does not know reads the same as a typo,
+          // so say what a valid target is instead of only echoing it back.
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+            content: [{ type: "text" as const, text: `Failed to send: ${result.error}. ${SEND_TARGET_HELP}` }],
             isError: true,
           };
         }
@@ -959,7 +977,7 @@ function formatInboxMessage(message: Message, sender: SenderDetails | undefined)
   return (
     `${header}\n${summary}${message.text}\n</peer-message>\n` +
     `Peer message from claude-peers. Call ack_message with message_ids: [${message.id}], ` +
-    `reply with send_message to "${message.from_id}" right away, then resume your work.`
+    `reply with send_message({to_id: "${message.from_id}", message: "..."}) right away, then resume your work.`
   );
 }
 
