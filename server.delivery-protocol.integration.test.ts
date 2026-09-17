@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 
 setDefaultTimeout(5_000);
@@ -237,6 +238,15 @@ class ClientHarness {
     };
   }
 
+  /** Close the child's stdin, the way a host ends a session. */
+  endStdin(): void {
+    try {
+      this.process.stdin.end();
+    } catch {
+      // Already closed.
+    }
+  }
+
   async listTools(): Promise<Array<JsonObject>> {
     const id = ++this.rpcId;
     await this.writeRpc({ jsonrpc: "2.0", id, method: "tools/list", params: {} });
@@ -273,14 +283,30 @@ class ClientHarness {
     }
 
     if (this.process.exitCode === null) {
-      this.process.kill("SIGTERM");
+      // Shut down the way a real host does. Measured against Claude Code
+      // 2.1.270: it closes the child's stdin and then kills it, never sending a
+      // signal. Going straight to SIGTERM made this harness POSIX-only — on
+      // Windows the signal runs no handler, so the server never unregistered
+      // and every test that waited for /unregister timed out.
+      try {
+        this.process.stdin.end();
+      } catch {
+        // Already closed.
+      }
       const exited = await Promise.race([
         this.process.exited.then(() => true),
         Bun.sleep(750).then(() => false),
       ]);
       if (!exited) {
-        this.process.kill("SIGKILL");
-        await this.process.exited;
+        this.process.kill("SIGTERM");
+        const exitedAfterSignal = await Promise.race([
+          this.process.exited.then(() => true),
+          Bun.sleep(750).then(() => false),
+        ]);
+        if (!exitedAfterSignal) {
+          this.process.kill("SIGKILL");
+          await this.process.exited;
+        }
       }
     }
 
@@ -731,7 +757,10 @@ describe("server.ts payload v2 delivery client", () => {
     await harness.stop();
   });
 
-  test("a standby whose parent dies during retry sleep cannot take ownership", async () => {
+  // POSIX-only by construction: it needs /bin/sh, and the ps-based orphan check
+  // it exercises is deliberately disabled on Windows, where stdin EOF is the
+  // orphan signal instead (see the "process lifecycle" block).
+  test.if(process.platform !== "win32")("a standby whose parent dies during retry sleep cannot take ownership", async () => {
     let registrationCount = 0;
     const harness = await startClient(
       (path) => {
@@ -912,4 +941,90 @@ describe("send_message target argument", () => {
     // The name a client would otherwise have to guess is in the prose too.
     expect(sendMessage!.description as string).toContain("to_id");
   });
+});
+
+// Claude Code 2.1.270 ends a session by closing the child's stdin and then
+// killing it — no signal at any point, and on Windows a signal would run no
+// handler anyway. Measured 2026-09-17 with a probe inside the child and a
+// request log inside a disposable broker: /register, then /claim-messages once
+// a second, then "stdin end (EOF)" and nothing else. No /unregister was ever
+// sent. Left alone the process also outlives its session: with nobody killing
+// it, it was still alive 8s after EOF because the poll and heartbeat loops hold
+// the event loop open.
+describe("process lifecycle", () => {
+  const leaseId = "lifecycle-lease";
+
+  function ownerBroker(): BrokerHandler {
+    return (path) => {
+      if (path === "/register") {
+        return {
+          json: {
+            id: "server-protocol-test-peer",
+            role: "owner",
+            lease_id: leaseId,
+            lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+          },
+        };
+      }
+    };
+  }
+
+  test("stdin EOF unregisters exactly once and stops the loops", async () => {
+    const harness = await startClient(ownerBroker());
+    await harness.waitForRequest("/register");
+    await harness.waitForRequest("/claim-messages", 2, 1_500);
+
+    harness.endStdin();
+    await harness.waitForRequest("/unregister", 1, 3_000);
+    const claimsAtShutdown = harness.requestsFor("/claim-messages").length;
+    const heartbeatsAtShutdown = harness.requestsFor("/heartbeat").length;
+
+    // Twenty poll intervals (20ms here) and ten heartbeats (35ms) worth of
+    // quiet: the loops are gone, not merely between ticks.
+    await Bun.sleep(400);
+    expect(harness.requestsFor("/unregister")).toHaveLength(1);
+    expect(harness.requestsFor("/claim-messages").length).toBe(claimsAtShutdown);
+    expect(harness.requestsFor("/heartbeat").length).toBe(heartbeatsAtShutdown);
+
+    const registration = harness.requestsFor("/register")[0]!.body;
+    expectLease(
+      harness.requestsFor("/unregister")[0]!.body,
+      registration.instance_id as string,
+      leaseId,
+    );
+  });
+
+  // POSIX hosts that do signal their children must keep working. Not executed
+  // on the Windows box this was developed on: a Windows SIGTERM terminates
+  // without running a handler, which is the whole reason EOF exists above.
+  test.if(process.platform !== "win32")(
+    "SIGTERM still unregisters on POSIX",
+    async () => {
+      const harness = await startClient(ownerBroker());
+      await harness.waitForRequest("/register");
+
+      harness.process.kill("SIGTERM");
+      await harness.waitForRequest("/unregister", 1, 3_000);
+      expect(harness.requestsFor("/unregister")).toHaveLength(1);
+    },
+  );
+
+  // Not a mock: git-bash ships this ps.exe and Windows boxes routinely have it
+  // on PATH. Asked about a Windows pid it prints nothing, Number("") is 0,
+  // Number.isInteger(0) is true — so the orphan check read "parent changed" on
+  // every call and the server shut itself down before it ever registered.
+  const msysPsDir = "C:/Program Files/Git/usr/bin";
+  test.if(process.platform === "win32" && existsSync(`${msysPsDir}/ps.exe`))(
+    "registers even with an MSYS ps on PATH",
+    async () => {
+      const harness = await startClient(ownerBroker(), {
+        PATH: `${msysPsDir};${process.env.PATH ?? ""}`,
+      });
+      await harness.waitForRequest("/register", 1, 3_000);
+      expect(harness.requestsFor("/register").length).toBeGreaterThan(0);
+
+      // And it keeps running rather than exiting as an orphan.
+      await harness.waitForRequest("/claim-messages", 2, 2_000);
+    },
+  );
 });

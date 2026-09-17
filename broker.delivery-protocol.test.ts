@@ -442,3 +442,45 @@ describe("legacy delivery compatibility", () => {
     expect(secondPoll.json.messages).toEqual([]);
   });
 });
+
+// Two different reaping rules, and which one applies decides how long a dead
+// session keeps being advertised. Measured 2026-09-17 against a real broker: a
+// peer on the broker's own machine went in 8.0s (the 30s pid sweep), while the
+// same peer claiming a different machine survived until its TTL — 89.8s with a
+// 1-minute TTL, and 20 minutes on the default. Nothing here changes broker.ts;
+// these pin the semantics the client-side lifecycle fix now leans on.
+describe("stale peer reaping", () => {
+  async function deadPid(): Promise<number> {
+    const corpse = Bun.spawn(["bun", "-e", ""], { stdout: "ignore", stderr: "ignore" });
+    await corpse.exited;
+    return corpse.pid!;
+  }
+
+  function registrationOn(requestedId: string, machine: string, pid: number) {
+    return { ...registration(requestedId, `${requestedId}-instance`, pid), machine };
+  }
+
+  async function listedIds(): Promise<string[]> {
+    const response = await post("/list-peers", { scope: "fleet" });
+    return ((response.json as unknown as Array<{ id: string }>) ?? []).map((p) => p.id);
+  }
+
+  test("a dead peer on the broker's own machine is reaped by the pid check", async () => {
+    const pid = await deadPid();
+    const registered = await post("/register", registrationOn("reap-local", require("os").hostname(), pid));
+    expect(registered.status).toBe(200);
+
+    // /list-peers runs cleanStalePeers, so no 30s wait is needed to observe it.
+    expect(await listedIds()).not.toContain("reap-local");
+  });
+
+  test("a dead peer on another machine survives until its TTL", async () => {
+    const pid = await deadPid();
+    const registered = await post("/register", registrationOn("reap-remote", "some-other-box", pid));
+    expect(registered.status).toBe(200);
+
+    // Same dead pid, same sweep — only the machine differs. The broker cannot
+    // check liveness across a machine boundary, so the row has to stay.
+    expect(await listedIds()).toContain("reap-remote");
+  });
+});

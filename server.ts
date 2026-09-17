@@ -238,15 +238,43 @@ function getTty(): string | null {
   return null;
 }
 
-function parentProcessChanged(): boolean {
-  if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
+// Returns the parent pid `ps` reports when it differs from the one this process
+// started under, or null when there is nothing to act on. Returning the observed
+// value rather than a boolean is the point: the old log line printed
+// process.ppid, which is not what the comparison used, so a real mismatch
+// printed as "changed from 22324 to 22324" and sent you looking at the logger.
+//
+// Windows is excluded outright. MSYS and Cygwin ship a `ps`, and it reports pids
+// from their own numbering space, which never match process.ppid — so on any
+// Windows box with git-bash on PATH this said "changed" every time and the
+// server shut itself down before it ever registered (measured 2026-09-17).
+// There is no Windows `ps` whose pids are comparable, so there is nothing to
+// compare; stdin EOF is the orphan signal there instead.
+function observedParentChange(): number | null {
+  if (process.platform === "win32") return null;
+  if (!START_PARENT_PID || START_PARENT_PID === 1) return null;
   try {
     const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
     const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
-    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
+    // An empty line parses to 0, which Number.isInteger accepts, so a `ps` that
+    // simply cannot see this pid used to read as "the parent changed". That is
+    // exactly what MSYS ps does when asked about a Windows pid. No output means
+    // unknown, and unknown is not grounds for shutting the server down.
+    if (!Number.isInteger(currentParent) || currentParent <= 0) return null;
+    if (currentParent === START_PARENT_PID) return null;
+    return currentParent;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// One place that checks, logs what it actually compared, and shuts down.
+async function exitIfOrphaned(where: string): Promise<boolean> {
+  const observed = observedParentChange();
+  if (observed === null) return false;
+  log(`Parent process changed from ${START_PARENT_PID} to ${observed}; exiting orphaned ${where}`);
+  await cleanupAndExit();
+  return true;
 }
 
 function cwdBasename(cwd: string): string {
@@ -1163,11 +1191,7 @@ function applyRegistration(registration: RegisterResponse): void {
 
 async function registerUntilActive(summary: string): Promise<void> {
   for (let attempt = 1; !shuttingDown; attempt++) {
-    if (parentProcessChanged()) {
-      log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server before registration`);
-      await cleanupAndExit();
-      return;
-    }
+    if (await exitIfOrphaned("MCP server before registration")) return;
     try {
       await ensureBroker();
       const registration = await brokerFetch<RegisterResponse>(
@@ -1179,11 +1203,7 @@ async function registerUntilActive(summary: string): Promise<void> {
 
       if (myRole === "standby") {
         log(`Peer ${myId} is on standby; retrying registration in ${REGISTER_RETRY_MS}ms`);
-        if (parentProcessChanged()) {
-          log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned standby MCP server`);
-          await cleanupAndExit();
-          return;
-        }
+        if (await exitIfOrphaned("standby MCP server")) return;
         await sleep(REGISTER_RETRY_MS);
         continue;
       }
@@ -1195,11 +1215,7 @@ async function registerUntilActive(summary: string): Promise<void> {
       myLeaseId = null;
       myLeaseExpiresAt = null;
       log(`Broker bring-up attempt ${attempt} failed (retrying in ${REGISTER_RETRY_MS}ms): ${e instanceof Error ? e.message : String(e)}`);
-      if (parentProcessChanged()) {
-        log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
-        await cleanupAndExit();
-        return;
-      }
+      if (await exitIfOrphaned("MCP server")) return;
       await sleep(REGISTER_RETRY_MS);
     }
   }
@@ -1218,11 +1234,7 @@ async function heartbeatLoop(): Promise<void> {
     await sleep(HEARTBEAT_INTERVAL_MS);
     if (shuttingDown || !myId || !canMutateBroker()) continue;
 
-    if (parentProcessChanged()) {
-      log(`Parent process changed from ${START_PARENT_PID} to ${process.ppid}; exiting orphaned MCP server`);
-      await cleanupAndExit();
-      return;
-    }
+    if (await exitIfOrphaned("MCP server")) return;
 
     try {
       const heartbeat = await brokerFetch<{
@@ -1353,6 +1365,29 @@ async function main() {
   log("MCP connected");
 
   // Register exit handlers now, before the (retrying) broker bring-up.
+  //
+  // stdin EOF is the shutdown signal that actually arrives. Measured against
+  // Claude Code 2.1.270 on Windows: at session end the host closes the child's
+  // stdin and then kills it, with no signal at any point and no exit handler
+  // ever running. Signals are not a fallback there either — a Windows
+  // process.kill(pid, "SIGTERM") terminates without running a handler at all.
+  // MCP SDK 1.27.1 does not cover this: StdioServerTransport.start() listens
+  // only for 'data' and 'error' on stdin and fires onclose only from its own
+  // close(), so EOF never surfaces through the transport.
+  //
+  // Without this the poll and heartbeat loops hold the process open after its
+  // session is gone (measured: still alive 8s after EOF with nothing to serve),
+  // and the peer is left registered. On the broker's own machine that costs up
+  // to 30s, until cleanStalePeers' pid check reaps it; against a remote broker
+  // the pid check does not apply and the row survives for the full peer TTL
+  // (20 minutes by default), advertising a session that has ended.
+  //
+  // cleanupAndExit latches on shuttingDown before its first await, so 'end' and
+  // 'close' both firing, or a signal racing them, unregisters exactly once.
+  process.stdin.on("end", () => void cleanupAndExit());
+  process.stdin.on("close", () => void cleanupAndExit());
+
+  // POSIX hosts that do signal their children keep the older path.
   process.on("SIGINT", cleanupAndExit);
   process.on("SIGTERM", cleanupAndExit);
 
