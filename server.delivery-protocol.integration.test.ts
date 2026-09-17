@@ -614,6 +614,98 @@ describe("server.ts payload v2 delivery client", () => {
     await harness.stop();
   });
 
+  // The broker hides a claimed message for CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS
+  // (30s) and then makes it claimable again, so a dead owner's mail is
+  // redelivered instead of lost. A live owner re-claimed its own message too:
+  // the poll loop pushed the same id into the host session once per visibility
+  // window, so a session that took ~66s to call ack_message was interrupted
+  // with the same message three times. Scaled 1/100 here to keep the test fast.
+  test("a slow application ack never re-pushes a message the host already has", async () => {
+    const leaseId = "visibility-redelivery-lease";
+    const visibilityMs = 300;
+    const inbound = [704, 705].map((id) => ({
+      id,
+      from_id: "patient-sender",
+      to_id: "server-protocol-test-peer",
+      text: `redelivery guard payload ${id}`,
+      sent_at: "2026-09-01T12:03:00.000Z",
+      delivered: false,
+    }));
+    let claimsServed = 0;
+    let servedAt = 0;
+    let acked = false;
+
+    const harness = await startClient((path, body) => {
+      if (path === "/register") {
+        return {
+          json: {
+            id: "server-protocol-test-peer",
+            role: "owner",
+            lease_id: leaseId,
+            lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+          },
+        };
+      }
+      if (path === "/claim-messages") {
+        // Undelivered and out of its visibility window: claimable again.
+        if (acked || (servedAt !== 0 && Date.now() - servedAt < visibilityMs)) {
+          return { json: { messages: [] } };
+        }
+        servedAt = Date.now();
+        claimsServed += 1;
+        return { json: { messages: inbound } };
+      }
+      if (path === "/ack-messages") {
+        acked = true;
+        return {
+          json: {
+            ok: true,
+            acked: Array.isArray(body.message_ids) ? body.message_ids.length : 0,
+          },
+        };
+      }
+    });
+
+    await harness.waitForRequest("/register");
+    await harness.waitForNotification("notifications/claude/channel", 1_250);
+
+    // Sit on both messages across three visibility windows, the way a session
+    // busy with a long turn does before it gets around to acking.
+    await waitUntil(
+      () => claimsServed >= 3,
+      "three visibility-timeout re-claims",
+      2_500,
+    );
+
+    const pushesOf = (id: number) =>
+      harness.rpcMessages.filter(
+        (message) =>
+          message.method === "notifications/claude/channel" &&
+          (message.params?.meta as JsonObject | undefined)?.message_id ===
+            String(id),
+      );
+    expect(pushesOf(704)).toHaveLength(1);
+    expect(pushesOf(705)).toHaveLength(1);
+    expect(
+      harness.rpcMessages.filter(
+        (message) => message.method === "notifications/claude/channel",
+      ),
+    ).toHaveLength(2);
+
+    // The late ack still lands, so the broker can finally retire the messages.
+    await harness.callTool("ack_message", { message_ids: [704, 705] });
+    await harness.waitForRequest("/ack-messages");
+    const ack = harness.requestsFor("/ack-messages")[0]!.body;
+    expect(ack.message_ids).toEqual([704, 705]);
+    expectLease(
+      ack,
+      harness.requestsFor("/register")[0]!.body.instance_id as string,
+      leaseId,
+    );
+
+    await harness.stop();
+  });
+
   test("a standby whose parent dies during retry sleep cannot take ownership", async () => {
     let registrationCount = 0;
     const harness = await startClient(

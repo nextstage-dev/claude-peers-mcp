@@ -298,6 +298,15 @@ const localMessageBuffer: BufferedMessage[] = [];
 const localMessageIds = new Set<number>();
 let localMessageBufferBytes = 0;
 
+// Messages this process already handed to its host session, still waiting for
+// the model's ack_message. The broker un-hides an unacked message once its
+// visibility timeout lapses so a dead owner's mail is redelivered rather than
+// lost — but the lease makes this process the only peer that can re-claim it,
+// so every lapse used to inject the same message into the session again. This
+// set is deliberately per-process: it dies with the process, which is exactly
+// when a redelivery is the right answer.
+const deliveredAwaitingAck = new Set<number>();
+
 function leaseCredentials(): { instance_id: string; lease_id: string } | Record<string, never> {
   if (myRole === "owner" && myLeaseId) {
     return { instance_id: PROCESS_INSTANCE_ID, lease_id: myLeaseId };
@@ -895,6 +904,9 @@ async function acknowledgeMessages(messageIds: number[]): Promise<number> {
     message_ids: [...new Set(messageIds)],
     ...leaseCredentials(),
   });
+  // Drop the guard for everything we asked about, not just what the broker
+  // counted: if an ack did not stick, a later redelivery is the safe outcome.
+  for (const id of messageIds) deliveredAwaitingAck.delete(id);
   return result.acked;
 }
 
@@ -993,6 +1005,14 @@ async function pollAndPushMessages(): Promise<void> {
     for (const message of claimed.messages) {
       const sender = senders.get(message.from_id);
       const buffered = bufferMessage(toBufferedMessage(message, sender));
+
+      if (deliveredAwaitingAck.has(message.id)) {
+        log(
+          `Message ${message.id} from ${message.from_id}: re-claimed after its visibility timeout, already delivered — not re-pushing`,
+        );
+        continue;
+      }
+
       let outcome = buffered ? "buffered" : "buffer-skipped";
 
       if (CHANNEL_RESPONSE_DELAY_MS > 0) {
@@ -1032,12 +1052,19 @@ async function pollAndPushMessages(): Promise<void> {
             },
           },
         });
+        delivered = true;
         outcome = claimed.requiresAck
           ? "notification-written-awaiting-application-ack"
           : "notification-written";
       } catch {
         outcome = "notification-failed-buffered";
       }
+
+      // Only a delivery that landed suppresses the next one; a push that failed
+      // on both routes still deserves the redelivery the broker will offer.
+      // Legacy /poll-messages peers are already marked delivered broker-side,
+      // so tracking them would only grow a set nothing ever drains.
+      if (delivered && claimed.requiresAck) deliveredAwaitingAck.add(message.id);
 
       const byteLength = new TextEncoder().encode(message.text).byteLength;
       log(`Message ${message.id} from ${message.from_id}: ${byteLength} bytes, ${outcome}`);
